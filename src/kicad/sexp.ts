@@ -92,6 +92,8 @@ export interface SchematicSymbol {
   sheet: string;
   at: { x: number; y: number; rot: number };
   uuid: string;
+  /** `(unit N)` of the placed instance; 1 for single-unit symbols. */
+  unit: number;
 }
 
 export interface PinDef {
@@ -99,6 +101,9 @@ export interface PinDef {
   name: string;
   x: number;
   y: number;
+  /** Unit the pin belongs to (from the `_<unit>_<style>` child it sits in);
+   * 0 for a pin in the common unit, drawn on every placed unit. */
+  unit: number;
 }
 
 interface ParsedSheet {
@@ -130,7 +135,10 @@ async function loadSheets(rootSch: string): Promise<ParsedSheet[]> {
   return out;
 }
 
-/** Pin definitions per lib symbol name, in symbol coordinates. */
+/** Pin definitions per lib symbol name, in symbol coordinates. Each pin
+ * carries the unit of the `_<unit>_<style>` child it was defined in (0 for
+ * the common unit); de Morgan alternates (style ≥ 2) are skipped so a pin is
+ * recorded once. */
 function libPinDefs(root: SexpNode[]): Map<string, PinDef[]> {
   const map = new Map<string, PinDef[]>();
   const libs = child(root, 'lib_symbols');
@@ -139,8 +147,15 @@ function libPinDefs(root: SexpNode[]): Map<string, PinDef[]> {
     const name = atomAt(sym, 1);
     if (!name) continue;
     const pins: PinDef[] = [];
-    const walk = (n: SexpNode): void => {
+    const walk = (n: SexpNode, unit: number): void => {
       if (!isList(n)) return;
+      if (tag(n) === 'symbol') {
+        const m = /_(\d+)_(\d+)$/.exec(atomAt(n, 1) ?? '');
+        if (m) {
+          if (Number(m[2]) >= 2) return; // de Morgan alternate body style
+          unit = Number(m[1]);
+        }
+      }
       if (tag(n) === 'pin') {
         const at = child(n, 'at');
         const num = atomAt(child(n, 'number'), 1);
@@ -151,15 +166,24 @@ function libPinDefs(root: SexpNode[]): Map<string, PinDef[]> {
             name: pinName ?? '~',
             x: parseFloat(atomAt(at, 1) ?? '0'),
             y: parseFloat(atomAt(at, 2) ?? '0'),
+            unit,
           });
         }
       }
-      for (const c of n) walk(c);
+      for (const c of n) walk(c, unit);
     };
-    walk(sym);
+    walk(sym, 0);
     map.set(name, pins);
   }
   return map;
+}
+
+/** The pins a PLACED instance actually shows: its own unit's plus the common
+ * unit's. A single-unit symbol keeps every pin (they are all unit ≤ 1). */
+export function pinsOfUnit(defs: PinDef[], unit: number): PinDef[] {
+  const multi = defs.some((p) => p.unit >= 2);
+  if (!multi) return defs;
+  return defs.filter((p) => p.unit === 0 || p.unit === unit);
 }
 
 /** Symbol-space → schematic-space transform (schematic Y grows downward). */
@@ -222,6 +246,7 @@ function symbolsOf(sheet: ParsedSheet): { node: SexpNode[]; sym: SchematicSymbol
           rot: parseFloat(atomAt(at, 3) ?? '0'),
         },
         uuid: atomAt(child(s, 'uuid'), 1) ?? '',
+        unit: parseInt(atomAt(child(s, 'unit'), 1) ?? '1', 10) || 1,
       },
     });
   }
@@ -310,6 +335,11 @@ export interface TextItem {
   /** Font height in mm (KiCad `(size h w)`); 1.27 when unstated. */
   height: number;
   hidden: boolean;
+  /** `(justify …)` components, or null when unspecified: KiCad anchors a
+   * free text at its centre unless the effects say otherwise, and the
+   * engine's group captions say `left top`. */
+  justifyH: 'left' | 'right' | null;
+  justifyV: 'top' | 'bottom' | null;
 }
 
 export interface LabelItem {
@@ -342,6 +372,8 @@ export interface PlacedSymbolGeom {
   at: { x: number; y: number; rot: number };
   mirror: 'x' | 'y' | null;
   isPower: boolean;
+  /** `(unit N)` of the placed instance; 1 for single-unit symbols. */
+  unit: number;
   /** Reference and Value property text (absolute schematic coordinates). */
   props: TextItem[];
 }
@@ -373,10 +405,16 @@ function effectsOf(node: SexpNode[]): { height: number; hidden: boolean } {
   const effects = child(node, 'effects');
   const font = effects ? child(effects, 'font') : undefined;
   const size = font ? child(font, 'size') : undefined;
-  // hidden: legacy bare `hide` atom, or v9 `(hide yes)`
+  // hidden: legacy bare `hide` atom, v9 `(hide yes)` inside effects, or
+  // KiCad 10's `(hide yes)` as a direct child of the property (a sheet
+  // re-saved by eeschema 10 flagged every hidden power reference as text
+  // on a wire until this was read)
   const hideNode = effects ? child(effects, 'hide') : undefined;
+  const hideProp = child(node, 'hide');
   const hidden =
-    (effects?.some((c) => c === 'hide') ?? false) || (hideNode !== undefined && atomAt(hideNode, 1) !== 'no');
+    (effects?.some((c) => c === 'hide') ?? false) ||
+    (hideNode !== undefined && atomAt(hideNode, 1) !== 'no') ||
+    (hideProp !== undefined && atomAt(hideProp, 1) !== 'no');
   return { height: size ? num(size, 1, 1.27) : 1.27, hidden };
 }
 
@@ -387,19 +425,34 @@ function libBodyBounds(root: SexpNode[]): Map<string, Bounds | null> {
   for (const sym of children(libs, 'symbol')) {
     const name = atomAt(sym, 1);
     if (!name) continue;
+    /** Union across the whole symbol under `name`, per-unit union (common
+     * graphics included) under `name#<unit>` — a placed unit of a multi-unit
+     * symbol draws only its own unit's graphics, so measuring it with the
+     * package union would size every instance like the whole gate pack. */
+    const perUnit = new Map<number, Bounds | null>();
     let b: Bounds | null = null;
-    const extend = (x: number, y: number): void => {
-      if (!b) b = { minX: x, minY: y, maxX: x, maxY: y };
-      else {
-        b.minX = Math.min(b.minX, x);
-        b.minY = Math.min(b.minY, y);
-        b.maxX = Math.max(b.maxX, x);
-        b.maxY = Math.max(b.maxY, y);
-      }
+    const grow = (prev: Bounds | null, x: number, y: number): Bounds => {
+      if (!prev) return { minX: x, minY: y, maxX: x, maxY: y };
+      prev.minX = Math.min(prev.minX, x);
+      prev.minY = Math.min(prev.minY, y);
+      prev.maxX = Math.max(prev.maxX, x);
+      prev.maxY = Math.max(prev.maxY, y);
+      return prev;
     };
-    const walk = (n: SexpNode): void => {
+    const walk = (n: SexpNode, unit: number | null): void => {
       if (!isList(n)) return;
       const t = tag(n);
+      if (t === 'symbol') {
+        const m = /_(\d+)_(\d+)$/.exec(atomAt(n, 1) ?? '');
+        if (m) {
+          if (Number(m[2]) >= 2) return; // de Morgan alternate body style
+          unit = Number(m[1]);
+        }
+      }
+      const extend = (x: number, y: number): void => {
+        b = grow(b, x, y);
+        if (unit !== null) perUnit.set(unit, grow(perUnit.get(unit) ?? null, x, y));
+      };
       if (t === 'rectangle') {
         const s = child(n, 'start');
         const e = child(n, 'end');
@@ -419,15 +472,29 @@ function libBodyBounds(root: SexpNode[]): Map<string, Bounds | null> {
         for (const xy of children(child(n, 'pts') ?? [], 'xy')) extend(num(xy, 1), num(xy, 2));
       }
       // pin/text graphics are deliberately excluded from the body box (design C2)
-      if (t !== 'pin' && t !== 'text') for (const c of n) walk(c);
+      if (t !== 'pin' && t !== 'text') for (const c of n) walk(c, unit);
     };
-    walk(sym);
+    walk(sym, null);
     map.set(name, b);
+    const common = perUnit.get(0) ?? null;
+    for (const [unit, ub] of perUnit) {
+      if (unit === 0) continue;
+      const merged =
+        ub && common
+          ? {
+              minX: Math.min(ub.minX, common.minX),
+              minY: Math.min(ub.minY, common.minY),
+              maxX: Math.max(ub.maxX, common.maxX),
+              maxY: Math.max(ub.maxY, common.maxY),
+            }
+          : (ub ?? (common ? { ...common } : null));
+      map.set(`${name}#${unit}`, merged);
+    }
   }
   return map;
 }
 
-function textItemsOf(sym: SexpNode[]): TextItem[] {
+function textItemsOf(sym: SexpNode[], symRot = 0): TextItem[] {
   const out: TextItem[] = [];
   for (const p of children(sym, 'property')) {
     const key = atomAt(p, 1);
@@ -438,9 +505,18 @@ function textItemsOf(sym: SexpNode[]): TextItem[] {
       text: atomAt(p, 2) ?? '',
       x: num(at, 1),
       y: num(at, 2),
-      rot: num(at, 3),
+      // KiCad draws a property at its stored angle PLUS the symbol's: a
+      // resistor turned 90 stores 90 on its fields to read horizontally,
+      // and a field stored at 0 on that resistor stands on end. The
+      // checker measures what is drawn.
+      rot: (((num(at, 3) + symRot) % 360) + 360) % 360,
       height: fx.height,
       hidden: fx.hidden,
+      // property text keeps the centred measurement: its justification is
+      // relative to the symbol's own rotation and mirror, which the checker
+      // does not model, and the engine emits it centred
+      justifyH: null,
+      justifyV: null,
     });
   }
   return out;
@@ -488,7 +564,18 @@ export async function readSheetGeometry(rootSch: string): Promise<SheetGeometry[
     const texts: TextItem[] = children(sheet.root, 'text').map((t) => {
       const at = child(t, 'at');
       const fx = effectsOf(t);
-      return { text: atomAt(t, 1) ?? '', x: num(at, 1), y: num(at, 2), rot: num(at, 3), height: fx.height, hidden: fx.hidden };
+      const effects = child(t, 'effects');
+      const justify = effects ? child(effects, 'justify') : undefined;
+      return {
+        text: atomAt(t, 1) ?? '',
+        x: num(at, 1),
+        y: num(at, 2),
+        rot: num(at, 3),
+        height: fx.height,
+        hidden: fx.hidden,
+        justifyH: justify?.some((c) => c === 'right') ? 'right' : justify?.some((c) => c === 'left') ? 'left' : null,
+        justifyV: justify?.some((c) => c === 'bottom') ? 'bottom' : justify?.some((c) => c === 'top') ? 'top' : null,
+      };
     });
     const rectangles: RectItem[] = children(sheet.root, 'rectangle').map((r) => {
       const s = child(r, 'start');
@@ -519,7 +606,8 @@ export async function readSheetGeometry(rootSch: string): Promise<SheetGeometry[
         at: sym.at,
         mirror,
         isPower: isPowerSymbol(sym.libId, powerSyms),
-        props: textItemsOf(node),
+        unit: sym.unit,
+        props: textItemsOf(node, sym.at.rot),
       })),
       wires,
       labels,
@@ -568,7 +656,10 @@ export async function pinNets(rootSch: string): Promise<PinNet[]> {
 
     const symPins: { sym: SchematicSymbol; pin: PinDef; k: string }[] = [];
     for (const { sym, mirror } of symbolsOf(sheet)) {
-      const defs = pinDefs.get(sym.libId) ?? [];
+      // a placed unit of a multi-unit symbol shows only its own unit's pins;
+      // resolving the whole package at each instance would invent phantom
+      // connection points at every other unit's coordinates
+      const defs = pinsOfUnit(pinDefs.get(sym.libId) ?? [], sym.unit);
       for (const pin of defs) {
         const abs = pinAbsolute(sym.at, mirror, pin);
         const k = key(abs.x, abs.y);

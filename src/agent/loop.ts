@@ -2,9 +2,10 @@ import path from 'node:path';
 import { readFile, writeFile } from 'node:fs/promises';
 import { execa } from 'execa';
 import type { Msg, Provider, Turn } from './types.js';
-import { availableTools, dispatchTool, type RunContext } from './tools.js';
+import { availableTools, dispatchToolResult, type RunContext } from './tools.js';
+import { flatten } from './envelope.js';
 import { CachingProvider } from './response-cache.js';
-import { withTimeout, TurnTimeoutError } from './recovery.js';
+import { withWatchdog, TurnTimeoutError, MAX_TURN_TIMEOUTS } from './recovery.js';
 import { buildSystemPrompt } from './prompts.js';
 import { loadConstraints, reopenDeferredAffects } from '../memory/constraints.js';
 import { isCreateProducedRepo, isEngineAuthoredSchematic } from '../kicad/fab.js';
@@ -22,6 +23,7 @@ import { collectRunMeta, renderCliHeader, type RunMeta, type RunMetaInput } from
 import { plainRenderer, fmtDuration, fmtTokens, type ProgressRenderer } from './render.js';
 import { styleHeaderLines } from './theme.js';
 import { ObligationsLedger } from './ledger.js';
+import { markTouched } from '../capabilities/helpers.js';
 import {
   gitPreflight,
   isDirty,
@@ -75,6 +77,19 @@ export interface RunOptions {
   renderer?: ProgressRenderer;
   /** Caller-known run identity for the metadata block (design D2). */
   meta?: RunMetaInput;
+  /**
+   * Repo-relative files a caller changed just before the run (the create
+   * pipeline's board populate). They count as touched by the run, so its
+   * verification and sync obligations apply to them too.
+   */
+  preTouched?: string[];
+  /**
+   * The caller's own completion check for this run (a `create` stage's contract).
+   * `finish` consults it before answering "all gates satisfied", so a run is never
+   * told it is done by the tool and not done by the gate (#310). Returns null when
+   * met, else what is missing.
+   */
+  stageGate?: () => Promise<string | null>;
 }
 
 export interface RunResult {
@@ -221,6 +236,15 @@ async function appendChangelog(
   await writeFile(p, lines.join('\n'), 'utf8');
 }
 
+/**
+ * True once `max` repairs have failed. A cycle is counted only for a failed repair
+ * (`countRepairCycle`), so the limit is reached on the `max`-th failure, not one
+ * after it; a limit of 0 allows no failed repair at all.
+ */
+export function repairBudgetExhausted(used: number, max: number): boolean {
+  return used >= Math.max(max, 1);
+}
+
 export async function runAgentLoop(opts: RunOptions): Promise<RunResult> {
   const providers = new Set<Provider>();
   try {
@@ -282,9 +306,19 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
     lastLegibility: null,
     lastScore: null,
     lastDrc: null,
+    boardAtStart: null,
     repairCycles: 0,
     finishRequest: null,
+    ...(opts.stageGate ? { stageGate: opts.stageGate } : {}),
   };
+  if (config.board) {
+    try {
+      ctx.boardAtStart = await readFile(path.join(repoRoot, config.board), 'utf8');
+    } catch {
+      // no board yet: nothing to compare unrouted connections against
+    }
+  }
+  for (const f of opts.preTouched ?? []) markTouched(ctx, f);
 
   // Session resume for claude-code / cursor is only correct when the response
   // cache is off: the cache replays turns a resumed session never saw. So enable
@@ -368,7 +402,7 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
   let plan: string | null = null;
   let nudges = 0;
   let turnTimeouts = 0;
-  const maxTurnTimeouts = 3;
+  const maxTurnTimeouts = MAX_TURN_TIMEOUTS;
 
   const stats = (exitPath: ExitPath): RunStats => ({
     exitPath,
@@ -525,28 +559,54 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
         : null;
     heartbeat?.unref?.();
     try {
+      // Inactivity watchdog plus hard cap: every onStream call is progress and
+      // restarts the idle deadline, so a turn that legitimately runs past
+      // turnTimeoutMs survives while it keeps producing output. A provider that
+      // never streams gets turnTimeoutMs as a whole-turn deadline, as before.
       res = await withRetry(
         () =>
-          withTimeout(
-            () => provider.chat(messages, tools, { onStream: (chars) => (streamedChars = chars) }),
-            config.turnTimeoutMs,
-            () => provider.close?.(),
+          withWatchdog(
+            (activity) =>
+              provider.chat(messages, tools, {
+                onStream: (chars) => {
+                  streamedChars = chars;
+                  activity();
+                },
+              }),
+            { idleMs: config.turnTimeoutMs, maxMs: config.turnMaxMs, onTimeout: () => provider.close?.() },
           ),
         { onRetry: (attempt) => log(`rate limited; retry ${attempt}`) },
       );
     } catch (err) {
+      if (err instanceof TurnTimeoutError && err.kind === 'max') {
+        // Still producing output at the hard cap: the turn is too large, not
+        // hung. Resending the identical request would stream just as long and
+        // hit the cap again, so fail now with a reason that says so; the create
+        // pipeline hands it to the diagnosis, which can split the work.
+        await transcript.event('turn-timeout', { kind: 'max', ms: err.ms, streamedChars });
+        return fail(
+          `a single provider turn was still producing output after ${fmtDuration(err.ms)} (turnMaxMs) and was stopped — ` +
+            'the turn is too large, not hung; split the work into smaller steps, or raise turnMaxMs',
+          'provider-error',
+        );
+      }
       if (err instanceof TurnTimeoutError) {
-        // A hung provider turn: the watchdog aborted the in-flight call and tore
-        // down its subprocess. Retry the same turn a bounded number of times
-        // before giving up, so a transient hang self-heals instead of stalling
-        // the run forever.
+        // A hung provider turn: no response or progress for turnTimeoutMs. The
+        // watchdog aborted the in-flight call and tore down its subprocess.
+        // Retry the same turn a bounded number of times before giving up, so a
+        // transient hang self-heals instead of stalling the run forever.
         if (turnTimeouts++ < maxTurnTimeouts) {
-          log(`turn exceeded ${config.turnTimeoutMs}ms; aborted the hung call and retrying (${turnTimeouts}/${maxTurnTimeouts})`);
-          await transcript.event('turn-timeout', { ms: config.turnTimeoutMs, attempt: turnTimeouts });
+          log(
+            `turn went ${fmtDuration(err.ms)} without a response or progress (turnTimeoutMs); aborted the hung call and retrying (${turnTimeouts}/${maxTurnTimeouts})`,
+          );
+          await transcript.event('turn-timeout', { kind: 'idle', ms: err.ms, attempt: turnTimeouts });
           turn--;
           continue;
         }
-        return fail(`provider turns timed out ${turnTimeouts}× (>${config.turnTimeoutMs}ms each)`, 'provider-error');
+        return fail(
+          `provider turns timed out ${turnTimeouts}× (no response or progress for ${fmtDuration(err.ms)} each)`,
+          'provider-error',
+        );
       }
       if (isRateLimit(err)) {
         const fallback = otherProvider(provider);
@@ -591,6 +651,9 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
     tokensOut += res.usage.outputTokens;
     perTurn.push({ turn: turn + 1, in: res.usage.inputTokens, out: res.usage.outputTokens });
     await transcript.event('assistant', { text: res.text, toolCalls: res.toolCalls });
+    // #320: the provider cut a reply that invented its own tool results. Keep the cut
+    // text: it is the evidence a reader needs to see what the model believed.
+    if (res.notice) await transcript.event('fabricated-results', { notice: res.notice, discarded: res.discarded ?? null });
 
     if (res.text) {
       if (!plan) plan = res.text;
@@ -615,13 +678,21 @@ async function runWithProviders(opts: RunOptions, providers: Set<Provider>): Pro
     nudges = 0;
 
     for (const call of res.toolCalls) {
-      const result = await dispatchTool(ctx, call.name, call.args);
-      await transcript.event('tool', { name: call.name, args: call.args, result });
-      r.toolResult(call.name, result.split('\n')[0] ?? '');
+      const envelope = await dispatchToolResult(ctx, call.name, call.args, { provider });
+      const result = flatten(envelope);
+      await transcript.event('tool', { name: call.name, args: call.args, result, envelope });
+      r.toolResult(call.name, envelope.summary, envelope.ok, envelope.viewHint);
       messages.push({ role: 'tool', toolCallId: call.id, content: result });
     }
+    // After the real results, so the model reads them first and then learns which
+    // of its own "results" to disregard (a tool-less turn got this as its nudge).
+    if (res.notice) messages.push({ role: 'user', content: res.notice });
 
-    if (ctx.repairCycles > config.maxRepairCycles) {
+    // Not when this same turn went on to finish: finish is approved only after
+    // the checks passed, so its violations do not persist, whatever the count
+    // reached on the way (a batched turn: a failed repair, a fix, a clean check,
+    // finish).
+    if (!ctx.finishRequest && repairBudgetExhausted(ctx.repairCycles, config.maxRepairCycles)) {
       return fail(`repair cycles exhausted (${config.maxRepairCycles}); violations persist`, 'repair-cycles-exhausted');
     }
 

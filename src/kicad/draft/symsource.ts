@@ -4,6 +4,7 @@ import path from 'node:path';
 import { parseSexp, children, child, isList, type SexpNode, type Bounds } from '../sexp.js';
 import { symbolSearchDirs, findLibraryFile, findSymbolAcrossLibraries, closestSymbolNames } from '../symlib.js';
 import { EMIT_VERSION, renameSymbolBlock } from '../emit.js';
+import { libTableRows } from '../libtable.js';
 
 /**
  * Symbol resolution for the drafting engine, with hermetic vendoring (design
@@ -47,6 +48,14 @@ export interface DraftPin {
   angle: number;
 }
 
+/** One placeable unit of a multi-unit symbol: its own pins and drawn body
+ * (unit graphics merged with the symbol's common unit-0 graphics). */
+export interface SymbolUnitView {
+  unit: number;
+  pins: DraftPin[];
+  body: Bounds | null;
+}
+
 export interface ResolvedSymbol {
   libId: string;
   /** Verbatim `(symbol "Name" …)` block from the vendored source. */
@@ -56,10 +65,21 @@ export interface ResolvedSymbol {
   body: Bounds | null;
   isPower: boolean;
   /** True when the library symbol defines more than one unit (an opamp, a
-   * gate pack). The engine places single instances only, and a multi-unit
-   * symbol's units share symbol-space pin coordinates, so drafting one would
-   * silently merge unrelated nets; validation refuses these. */
+   * gate pack). Units share symbol-space pin coordinates, so a single placed
+   * instance would overlay unrelated pins on one point; the engine places
+   * each unit as its own instance instead, using `units` below. */
   multiUnit: boolean;
+  /** Per-unit views (pins and body), present iff `multiUnit`. Only the
+   * default body style (`_<unit>_0`/`_<unit>_1` children) contributes — a
+   * de Morgan alternate (style ≥ 2) repeats the same pins at other
+   * coordinates and would double them. Common (`_0_*`) pins are included in
+   * EVERY unit's view, because KiCad draws them on every placed unit. */
+  units?: SymbolUnitView[];
+  /** Pin numbers defined in the COMMON unit (`_0_*` children) — the classic
+   * home of a gate pack's power pins (an LM358's V+/V-). Each is drawn on
+   * every placed unit, so the engine wires it at every instance; the shared
+   * net makes the appearances electrically one point. */
+  commonUnitPins?: string[];
 }
 
 /** Extract the top-level `(symbol "name" …)` block from library text, verbatim. */
@@ -100,6 +120,48 @@ function maxUnitOf(sym: SexpNode[]): number {
     if (m) max = Math.max(max, Number(m[1]));
   }
   return max;
+}
+
+const mergeBounds = (a: Bounds | null, b: Bounds | null): Bounds | null => {
+  if (!a) return b ? { ...b } : null;
+  if (!b) return { ...a };
+  return {
+    minX: Math.min(a.minX, b.minX),
+    minY: Math.min(a.minY, b.minY),
+    maxX: Math.max(a.maxX, b.maxX),
+    maxY: Math.max(a.maxY, b.maxY),
+  };
+};
+
+/**
+ * Per-unit views of a multi-unit block. Each unit's pins and body come from
+ * its own `_<unit>_<style>` children; the common `_0_*` graphics are merged
+ * into every unit's body because KiCad draws them on every unit. Only body
+ * styles 0 and 1 contribute — style ≥ 2 is the de Morgan alternate, which
+ * repeats the same pins at other coordinates and would double them.
+ */
+function unitViewsOf(sym: SexpNode[]): { units: SymbolUnitView[]; commonUnitPins: string[] } {
+  const byUnit = new Map<number, SexpNode[][]>();
+  for (const c of children(sym, 'symbol')) {
+    const name = atomAt(c, 1);
+    const m = name ? /_(\d+)_(\d+)$/.exec(name) : null;
+    if (!m || Number(m[2]) >= 2) continue;
+    const u = Number(m[1]);
+    byUnit.set(u, [...(byUnit.get(u) ?? []), c]);
+  }
+  const common = byUnit.get(0) ?? [];
+  const commonPins = common.flatMap((c) => pinsOf(c));
+  const commonUnitPins = commonPins.map((p) => p.number);
+  const commonBody = common.reduce<Bounds | null>((b, c) => mergeBounds(b, bodyOf(c)), null);
+  const units: SymbolUnitView[] = [...byUnit.keys()]
+    .filter((u) => u >= 1)
+    .sort((a, b) => a - b)
+    .map((u) => ({
+      unit: u,
+      pins: [...byUnit.get(u)!.flatMap((n) => pinsOf(n)), ...commonPins],
+      body: byUnit.get(u)!.reduce<Bounds | null>((b, n) => mergeBounds(b, bodyOf(n)), commonBody),
+    }));
+  return { units, commonUnitPins };
 }
 
 function parseSymbolNode(block: string): SexpNode[] {
@@ -221,6 +283,26 @@ async function crossLibrarySuggestions(name: string, lib: string, dirs: string[]
 
 export class SymbolSource {
   private cache = new Map<string, ResolvedSymbol>();
+  private projectLibs: Promise<Map<string, string>> | null = null;
+
+  /**
+   * Libraries the project's own `sym-lib-table` names (#314): a project-local
+   * vendor library (an Espressif module, say) resolves without copying the
+   * stock set around it. Rows pointing into the vendored cache are skipped,
+   * since `resolve` reads the cache first anyway.
+   */
+  private async projectLibrary(lib: string): Promise<string | null> {
+    this.projectLibs ??= (async () => {
+      const { rows } = await libTableRows('sym', { projectDir: this.projectDir ?? this.repoRoot, global: false });
+      const cache = path.resolve(this.cacheDir());
+      const out = new Map<string, string>();
+      for (const [name, row] of rows) {
+        if (!path.resolve(row.uri).startsWith(cache + path.sep) && existsSync(row.uri)) out.set(name, row.uri);
+      }
+      return out;
+    })();
+    return (await this.projectLibs).get(lib) ?? null;
+  }
 
   /**
    * @param repoRoot project root; the vendored cache lives at `<root>/sym-lib-cache/`
@@ -229,11 +311,15 @@ export class SymbolSource {
    *   vendored cache or the installed libraries verbatim, but nothing is copied
    *   into `sym-lib-cache/`. For read-shaped callers (`draftSchematicToText`, staleness
    *   probes) that must not mutate the working tree.
+   * @param projectDir the directory holding the `.kicad_pro` (beside the
+   *   schematic): its `sym-lib-table` and `${KIPRJMOD}`. Defaults to `repoRoot`,
+   *   which is right only for a project at the repo root.
    */
   constructor(
     private readonly repoRoot: string,
     private readonly searchDirs?: string[],
     private readonly vendor: boolean = true,
+    private readonly projectDir?: string,
   ) {}
 
   cacheDir(): string {
@@ -247,14 +333,26 @@ export class SymbolSource {
     return [...this.libs].sort();
   }
 
-  /** Write an engine-generated symbol block into the vendored cache (power lib). */
+  /**
+   * Write an engine-generated symbol block into the vendored cache (power lib).
+   *
+   * A generated block is the engine's, not a vendor's: when the engine's
+   * drawing of a rail or ground changes, the cached copy must follow, or every
+   * embedded power symbol on the sheet raises a lib_symbol_mismatch warning
+   * against the stale library (the triangle-ground redraw hit 111 of them on
+   * esp32-amp). A block already cached byte-for-byte is left alone.
+   */
   async vendorGenerated(libId: string, block: string): Promise<void> {
     const lib = libId.slice(0, libId.indexOf(':'));
     const name = libId.slice(libId.indexOf(':') + 1);
     const file = path.join(this.cacheDir(), vendorFileName(lib));
     await mkdir(this.cacheDir(), { recursive: true });
-    const text = existsSync(file) ? await readFile(file, 'utf8') : emptyVendorLib();
-    if (!extractSymbolBlock(text, name)) await writeFile(file, appendToVendorLib(text, block), 'utf8');
+    let text = existsSync(file) ? await readFile(file, 'utf8') : emptyVendorLib();
+    const cached = extractSymbolBlock(text, name);
+    if (cached !== block) {
+      if (cached) text = text.replace(cached + '\n', '').replace(cached, '');
+      await writeFile(file, appendToVendorLib(text, block), 'utf8');
+    }
     this.libs.add(lib);
   }
 
@@ -296,7 +394,16 @@ export class SymbolSource {
     // the stack gives out, mid-draft, with no attributable message.
     if (depth >= MAX_EXTENDS_DEPTH) throw new SymbolResolutionError(libId, 'derived-unsupported');
     const base = await this.resolve(`${lib}:${baseName}`, depth + 1);
-    return { libId, sourceText: base.sourceText, pins: base.pins, body: base.body, isPower: base.isPower, multiUnit: base.multiUnit };
+    return {
+      libId,
+      sourceText: base.sourceText,
+      pins: base.pins,
+      body: base.body,
+      isPower: base.isPower,
+      multiUnit: base.multiUnit,
+      units: base.units,
+      commonUnitPins: base.commonUnitPins,
+    };
   }
 
   /** Resolve a lib_id: vendored copy first, else installed library (then vendor it). */
@@ -309,13 +416,20 @@ export class SymbolSource {
     const vendored = path.join(this.cacheDir(), vendorFileName(lib));
     let block: string | null = null;
     let fromInstalled = false;
+    // a library the project's own sym-lib-table names is already project-local:
+    // it is read in place, never copied into the vendored cache, so the user's
+    // row stays the source and every symbol in it stays reachable (a partial
+    // cache under the same nickname would shadow the rest)
+    let fromProject = false;
     if (existsSync(vendored)) {
       block = extractSymbolBlock(await readFile(vendored, 'utf8'), name);
       if (block) this.libs.add(lib);
     }
     if (!block) {
       const dirs = this.searchDirs ?? (await symbolSearchDirs());
-      const file = await findLibraryFile(lib, dirs);
+      const project = await this.projectLibrary(lib);
+      fromProject = project !== null;
+      const file = project ?? (await findLibraryFile(lib, dirs));
       if (!file) {
         const elsewhere = await crossLibrarySuggestions(name, lib, dirs);
         if (elsewhere.length) throw new SymbolResolutionError(libId, 'found-elsewhere', elsewhere);
@@ -341,12 +455,12 @@ export class SymbolSource {
         throw new SymbolResolutionError(libId, 'no-symbol', candidates);
       }
       fromInstalled = true;
-      this.libs.add(lib);
+      if (!fromProject) this.libs.add(lib);
     }
 
     const node = parseSymbolNode(block);
     const inherited = await this.inherit(libId, lib, node, depth);
-    if (fromInstalled && this.vendor) {
+    if (fromInstalled && this.vendor && !fromProject) {
       // Derived symbols vendor FLATTENED under their own name, never as the
       // library's `extends` stub. A vendored stub makes the project
       // sym-lib-table resolve the derived name to base-geometry-plus-derived-
@@ -361,13 +475,15 @@ export class SymbolSource {
         await writeFile(vendored, appendToVendorLib(existing, vendorBlock), 'utf8');
       }
     }
+    const multiUnit = maxUnitOf(node) >= 2;
     const resolved: ResolvedSymbol = inherited ?? {
       libId,
       sourceText: block,
       pins: pinsOf(node),
       body: bodyOf(node),
       isPower: child(node, 'power') !== undefined || libId.startsWith('power:'),
-      multiUnit: maxUnitOf(node) >= 2,
+      multiUnit,
+      ...(multiUnit ? unitViewsOf(node) : {}),
     };
     this.cache.set(libId, resolved);
     return resolved;
@@ -401,15 +517,16 @@ export function powerSymbolSource(rawNet: string, kind: 'rail' | 'ground'): { li
   const name = powerNetToken(rawNet);
   const libId = `copperhead_power:${name}`;
   // Symbol space is Y-up and the schematic transform flips it: negative-Y
-  // graphics here render BELOW the connection point on the sheet. Ground bars
-  // hang below their pin (angle 270 = line toward -Y body); rail bars sit
-  // above (angle 90).
+  // graphics here render BELOW the connection point on the sheet. A ground
+  // hangs below its pin (angle 270 = line toward -Y body) as a stem and an
+  // open triangle, the reference-ground glyph; a rail rises above (angle 90)
+  // as a stem and a filled arrowhead, the way KiCad's own +3V3 draws. Both
+  // reach 2.54 from the pin, inside the 2-unit box the engine reserves.
   const body =
     kind === 'ground'
       ? `\t(symbol "${name}_0_1"
-\t\t(polyline (pts (xy -1.27 -1.27) (xy 1.27 -1.27)) (stroke (width 0.254) (type default)) (fill (type none)))
-\t\t(polyline (pts (xy -0.762 -1.778) (xy 0.762 -1.778)) (stroke (width 0.254) (type default)) (fill (type none)))
-\t\t(polyline (pts (xy -0.254 -2.286) (xy 0.254 -2.286)) (stroke (width 0.254) (type default)) (fill (type none)))
+\t\t(polyline (pts (xy 0 0) (xy 0 -1.27)) (stroke (width 0.254) (type default)) (fill (type none)))
+\t\t(polyline (pts (xy -1.27 -1.27) (xy 1.27 -1.27) (xy 0 -2.54) (xy -1.27 -1.27)) (stroke (width 0.254) (type default)) (fill (type none)))
 \t)
 \t(symbol "${name}_1_1"
 \t\t(pin power_in line (at 0 0 270) (length 0) hide
@@ -418,7 +535,8 @@ export function powerSymbolSource(rawNet: string, kind: 'rail' | 'ground'): { li
 \t\t)
 \t)`
       : `\t(symbol "${name}_0_1"
-\t\t(polyline (pts (xy -1.27 1.27) (xy 1.27 1.27)) (stroke (width 0.254) (type default)) (fill (type none)))
+\t\t(polyline (pts (xy 0 0) (xy 0 1.27)) (stroke (width 0.254) (type default)) (fill (type none)))
+\t\t(polyline (pts (xy -0.762 1.27) (xy 0 2.54) (xy 0.762 1.27) (xy -0.762 1.27)) (stroke (width 0.254) (type default)) (fill (type outline)))
 \t)
 \t(symbol "${name}_1_1"
 \t\t(pin power_in line (at 0 0 90) (length 0) hide

@@ -86,7 +86,7 @@ describe('copperhead check (AC-2)', () => {
       const res = await runCheck(repo, silent);
       expect(res.ok).toBe(true);
       expect(res.erc).toEqual({ ok: true, violations: 0 });
-      expect(res.drc).toEqual({ ok: true, violations: 0 });
+      expect(res.drc).toEqual({ ok: true, violations: 0, unrouted: 0, intrinsic: 0 });
       expect(res.drift.ok).toBe(true);
       expect(Object.keys(res).sort()).toEqual(['constraints', 'drc', 'drift', 'erc', 'legibility', 'ok', 'openspec']);
       expect(res.legibility.counts.error).toBe(0);
@@ -167,6 +167,7 @@ describe('check is LLM-free by construction (AC-2.1)', () => {
       seen.add(file);
       const text = await readFile(file, 'utf8');
       expect(text, file).not.toMatch(/providers\/|from 'openai'|@anthropic-ai/);
+      expect(file, file).not.toMatch(/capabilities/);
       for (const m of text.matchAll(/from '(\.[^']+)\.js'/g)) {
         queue.push(path.join(path.dirname(file), m[1]!) + '.ts');
       }

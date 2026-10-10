@@ -4,6 +4,7 @@ import path from 'node:path';
 import {
   readSheetGeometry,
   pinAbsolute,
+  pinsOfUnit,
   type Bounds,
   type SheetGeometry,
   type TextItem,
@@ -12,6 +13,7 @@ import {
   type WireSeg,
   type PlacedSymbolGeom,
 } from './sexp.js';
+import { strokeTextExtent, strokeTextHeight } from './strokefont.js';
 import type { LegibilityUserConfig } from '../config.js';
 
 /**
@@ -78,9 +80,11 @@ const TOL = 0.01;
 const TEXT_ADVANCE = 0.6;
 /** Drawing-frame inset from the paper edge. */
 const FRAME_BORDER = 10;
-/** Reserved title-block rectangle in the bottom-right of the frame, clamped on small pages. */
+/** Reserved title-block rectangle in the bottom-right of the frame: KiCad's
+ * default title block, (110, 34) to (2, 2) mm off the frame corner, the same
+ * size on every paper. */
 const TITLE_BLOCK_W = 110;
-const TITLE_BLOCK_H = 30;
+const TITLE_BLOCK_H = 34;
 
 /** Standard sizes as KiCad draws them for schematics: landscape, mm. */
 const PAPER_SIZES: Record<string, { w: number; h: number }> = {
@@ -182,12 +186,50 @@ function transformBounds(at: { x: number; y: number; rot: number }, mirror: 'x' 
 }
 
 /** Conservative text box, centered on the anchor; vertical when rotated 90/270. */
-function textBounds(t: { text: string; x: number; y: number; rot: number; height: number }): Bounds {
+function textBounds(t: {
+  text: string;
+  x: number;
+  y: number;
+  rot: number;
+  height: number;
+  justifyH?: 'left' | 'right' | null;
+  justifyV?: 'top' | 'bottom' | null;
+}): Bounds {
   const w = Math.max(1, t.text.length) * TEXT_ADVANCE * t.height;
   const h = t.height;
   const vertical = Math.abs(t.rot % 180) === 90;
   const [bw, bh] = vertical ? [h, w] : [w, h];
-  return { minX: t.x - bw / 2, minY: t.y - bh / 2, maxX: t.x + bw / 2, maxY: t.y + bh / 2 };
+  // A free text is centred on its anchor unless its effects justify it: the
+  // engine's group captions are `left top`, so their box runs right and down
+  // from the anchor. Measuring those as centred put half the caption's width
+  // left of the group box and flagged a caption 12 mm inside the frame as
+  // out of it (esp32-amp, A1 at full width).
+  const jh = vertical ? null : (t.justifyH ?? null);
+  const jv = vertical ? null : (t.justifyV ?? null);
+  const minX = jh === 'left' ? t.x : jh === 'right' ? t.x - bw : t.x - bw / 2;
+  const minY = jv === 'top' ? t.y : jv === 'bottom' ? t.y - bh : t.y - bh / 2;
+  return { minX, minY, maxX: minX + bw, maxY: minY + bh };
+}
+
+/**
+ * A group caption's box, measured to CONTAIN its ink (strokefont.ts) where
+ * `textBounds` is short on purpose (design C3): the caption-overflow check
+ * asks whether the caption stays inside its group, and a short box let a
+ * caption drawn 22 mm past its group's edge pass as clean (#307). A wrapped
+ * caption is as wide as its widest line and one line pitch taller per extra
+ * line; a rotated caption keeps its centred box at the contained width.
+ */
+function captionBounds(t: TextItem): Bounds {
+  const e = strokeTextExtent(t.text, t.height, t.justifyH ?? 'center');
+  if (Math.abs(t.rot % 180) === 90) {
+    const box = textBounds(t);
+    const w = e.maxX - e.minX;
+    const cy = (box.minY + box.maxY) / 2;
+    return { minX: box.minX, maxX: box.maxX, minY: cy - w / 2, maxY: cy + w / 2 };
+  }
+  const bh = strokeTextHeight(t.text, t.height);
+  const minY = t.justifyV === 'top' ? t.y : t.justifyV === 'bottom' ? t.y - bh : t.y - bh / 2;
+  return { minX: t.x + e.minX, maxX: t.x + e.maxX, minY, maxY: minY + bh };
 }
 
 /**
@@ -209,19 +251,52 @@ function textBounds(t: { text: string; x: number; y: number; rot: number; height
  * of them on the wrong side of the anchor either invents a collision with the
  * symbol the label serves or hides a real one.
  */
-function labelBounds(l: { name: string; x: number; y: number; rot: number; height: number; justify?: 'left' | 'right' | null }): Bounds {
+function labelBounds(l: { name: string; x: number; y: number; rot: number; height: number; justify?: 'left' | 'right' | null; kind?: string }): Bounds {
   const w = Math.max(1, l.name.length) * TEXT_ADVANCE * l.height;
   const h = l.height;
   const rot = ((l.rot % 360) + 360) % 360;
+  if (l.kind === 'global_label' || l.kind === 'hierarchical_label') {
+    // A flag is drawn two heights tall, CENTRED on the anchor line, with its
+    // outline (a margin each side of the text plus the pointed tip) running
+    // away from the anchor in the angle's direction; the stored justification
+    // only restates that direction. Measured from eeschema's own outline.
+    const fw = w + 2 * h;
+    if (rot === 90) return { minX: l.x - h, minY: l.y - fw, maxX: l.x + h, maxY: l.y };
+    if (rot === 270) return { minX: l.x - h, minY: l.y, maxX: l.x + h, maxY: l.y + fw };
+    if (rot === 180) return { minX: l.x - fw, minY: l.y - h, maxX: l.x, maxY: l.y + h };
+    return { minX: l.x, minY: l.y - h, maxX: l.x + fw, maxY: l.y + h };
+  }
   const justified = l.justify ?? (rot === 180 || rot === 270 ? 'right' : 'left');
   if (rot === 90 || rot === 270) {
     return justified === 'left'
       ? { minX: l.x - h / 2, minY: l.y - w, maxX: l.x + h / 2, maxY: l.y }
       : { minX: l.x - h / 2, minY: l.y, maxX: l.x + h / 2, maxY: l.y + w };
   }
+  // Vertically the text STANDS on its anchor: eeschema draws a horizontal
+  // label bottom-justified, so the box runs one height above the anchor line
+  // and nothing below it. Measuring it centred put half the box below the
+  // wire the label sits on and called every label on a horizontal wire "text
+  // on a wire" — the ordinary way a person names a wire.
+  // eeschema lifts the text off the wire by its label offset before it
+  // stands: measured on a plotted sheet the ink of a 1.27 mm label runs from
+  // 0.46 to 1.93 mm above its line, so the box reaches LOCAL_LABEL_RISE
+  // heights up (one height let XTAL1 print into the ISP_SCK flag on the pin
+  // row above and report clean)
+  const up = h * LOCAL_LABEL_RISE;
   return justified === 'right'
-    ? { minX: l.x - w, minY: l.y - h / 2, maxX: l.x, maxY: l.y + h / 2 }
-    : { minX: l.x, minY: l.y - h / 2, maxX: l.x + w, maxY: l.y + h / 2 };
+    ? { minX: l.x - w, minY: l.y - up, maxX: l.x, maxY: l.y }
+    : { minX: l.x, minY: l.y - up, maxX: l.x + w, maxY: l.y };
+}
+/** How far above its wire a plain label's text reaches, in text heights. */
+const LOCAL_LABEL_RISE = 1.54;
+
+/** Does the wire lie behind a flag's tip, along the direction the flag's text does NOT extend? */
+function onPoleSide(w: WireSeg, l: { x: number; y: number; rot: number }): boolean {
+  const r = ((l.rot % 360) + 360) % 360;
+  if (r === 0) return Math.max(w.x1, w.x2) <= l.x + TOL;
+  if (r === 180) return Math.min(w.x1, w.x2) >= l.x - TOL;
+  if (r === 90) return Math.min(w.y1, w.y2) >= l.y - TOL;
+  return Math.max(w.y1, w.y2) <= l.y + TOL;
 }
 
 function segIntersectsBounds(s: WireSeg, b: Bounds): boolean {
@@ -284,6 +359,7 @@ interface Group {
   rect: RectItem;
   bounds: Bounds;
   caption: string | null;
+  capItem?: TextItem;
   label: string;
 }
 
@@ -326,7 +402,12 @@ export async function checkLegibility(rootSch: string, opts: CheckLegibilityOpti
   const kept: LegibilityFinding[] = [];
   const perKey = new Map<string, number>();
   for (const f of raw) {
-    const key = `${f.kind} ${f.sheet}`;
+    // Separator written as an escape, never as a literal NUL byte: a raw NUL in
+    // the source makes git-grep, ripgrep and most editors classify this whole file
+    // as binary and silently skip it, so a search for anything in here comes back
+    // empty with no error rather than no match. Same string at runtime, and still a
+    // separator no kind or sheet name can contain.
+    const key = `${f.kind}\u0000${f.sheet}`;
     const n = (perKey.get(key) ?? 0) + 1;
     perKey.set(key, n);
     if (n <= th.familyCap) kept.push(f);
@@ -366,8 +447,10 @@ function checkSheet(
 
   // --- geometry prep ---
   const syms: SymbolGeom[] = sheet.symbols.map((sym) => {
-    const lib = sheet.libBounds.get(sym.libId) ?? null;
-    const pins = (sheet.libPins.get(sym.libId) ?? []).map((p) => pinAbsolute(sym.at, sym.mirror, p));
+    // a placed unit of a multi-unit symbol draws only its own unit's body and
+    // pins; measuring it with the whole package would flag phantom collisions
+    const lib = sheet.libBounds.get(`${sym.libId}#${sym.unit}`) ?? sheet.libBounds.get(sym.libId) ?? null;
+    const pins = pinsOfUnit(sheet.libPins.get(sym.libId) ?? [], sym.unit).map((p) => pinAbsolute(sym.at, sym.mirror, p));
     // A body-less symbol (graphics-free lib entry) falls back to its pin extent
     // so geometric families still see it; a symbol with neither is skipped.
     const body = lib
@@ -376,21 +459,6 @@ function checkSheet(
     return { sym, body, pins };
   });
   const realSyms = syms.filter((s) => !s.sym.isPower);
-
-  const visibleTexts: { owner: string; ownerRef: string | null; t: TextItem; box: Bounds }[] = [];
-  for (const s of sheet.symbols) {
-    for (const p of s.props) {
-      if (!p.hidden && p.text) visibleTexts.push({ owner: `${s.ref} ${p.text === s.value ? 'Value' : 'Reference'}`, ownerRef: s.ref, t: p, box: textBounds(p) });
-    }
-  }
-  for (const t of sheet.texts) {
-    if (!t.hidden && t.text) visibleTexts.push({ owner: `text "${t.text}"`, ownerRef: null, t, box: textBounds(t) });
-  }
-  const labelBoxes = sheet.labels.map((l) => ({
-    l,
-    box: labelBounds(l),
-    attached: sheet.wires.filter((w) => pointOnSeg(l.x, l.y, w)),
-  }));
 
   // --- groups (design C1): sheet rectangles with a caption in the top band ---
   const groups: Group[] = sheet.rectangles.map((rect, i) => {
@@ -404,9 +472,31 @@ function checkSheet(
     const cap = sheet.texts.find(
       (t) => !t.hidden && t.text && pointIn(t.x, t.y, bounds) && t.y <= bounds.minY + band,
     );
-    const caption = cap?.text ?? null;
-    return { rect, bounds, caption, label: caption ?? `group#${i + 1}` };
+    // a wrapped caption names its group across its lines
+    const caption = cap ? cap.text.replace(/\s+/g, ' ').trim() : null;
+    return { rect, bounds, caption, capItem: cap, label: caption ?? `group#${i + 1}` };
   });
+
+  const captionTexts = new Set(groups.map((g) => g.capItem).filter(Boolean));
+
+  const visibleTexts: { owner: string; ownerRef: string | null; t: TextItem; box: Bounds }[] = [];
+  for (const s of sheet.symbols) {
+    for (const p of s.props) {
+      if (!p.hidden && p.text) visibleTexts.push({ owner: `${s.ref} ${p.text === s.value ? 'Value' : 'Reference'}`, ownerRef: s.ref, t: p, box: textBounds(p) });
+    }
+  }
+  for (const t of sheet.texts) {
+    if (!t.hidden && t.text) visibleTexts.push({ owner: `text "${t.text}"`, ownerRef: null, t, box: captionTexts.has(t) ? captionBounds(t) : textBounds(t) });
+  }
+  const labelBoxes = sheet.labels.map((l) => ({
+    l,
+    box: labelBounds(l),
+    // a plain label stands above its wire, so every wire through the anchor
+    // is its attachment; a flag is drawn centred on the anchor line, so a
+    // wire continuing under the text runs through the flag — only the wire
+    // behind the tip (the pole side) attaches it
+    attached: sheet.wires.filter((w) => pointOnSeg(l.x, l.y, w) && (l.kind === 'label' || onPoleSide(w, l))),
+  }));
 
   // --- off-grid (reported first, design C9) ---
   for (const { sym } of syms) {
@@ -497,6 +587,19 @@ function checkSheet(
       const nearest = captionNames[0]!;
       add('unlabeled-group', S, center(g.bounds), [g.caption], `group caption "${g.caption}" names nothing in SUBSYSTEMS.md or BOM.md; use a documented name (e.g. "${nearest}")`);
     }
+    if (g.capItem) {
+      const cBox = captionBounds(g.capItem);
+      if (!boundsContain(g.bounds, cBox)) {
+        const over: [string, number][] = [
+          ['right', cBox.maxX - g.bounds.maxX],
+          ['left', g.bounds.minX - cBox.minX],
+          ['top', g.bounds.minY - cBox.minY],
+          ['bottom', cBox.maxY - g.bounds.maxY],
+        ];
+        const [edge, by] = over.reduce((a, b) => (b[1] > a[1] ? b : a));
+        add('unlabeled-group', S, center(cBox), [g.label], `group caption "${g.caption}" runs ${fmt(by)}mm past its group rectangle's ${edge} edge; widen the group rectangle or shorten the caption`);
+      }
+    }
   }
   for (let i = 0; i < groups.length; i++) {
     for (let j = i + 1; j < groups.length; j++) {
@@ -521,6 +624,9 @@ function checkSheet(
   // --- label-orientation: rotated where a horizontal draw would collide with nothing ---
   for (const lb of labelBoxes) {
     if (Math.abs(lb.l.rot % 180) !== 90) continue;
+    // a flag continuing a vertical wire is oriented by that wire, not by
+    // taste: turning it horizontal would hang it sideways off the wire end
+    if (lb.l.kind !== 'label' && lb.attached.some((w) => Math.abs(w.x1 - w.x2) < TOL)) continue;
     const horizontal = labelBounds({ ...lb.l, rot: 0 });
     const collides =
       realSyms.some((s) => s.body && boundsOverlap(horizontal, s.body)) ||
@@ -537,8 +643,8 @@ function checkSheet(
     skipped.push({ family: 'page-checks', reason: `sheet "${S}": paper "${sheet.paper.name ?? '(none)'}" is not a recognized standard size; out-of-frame and low-utilization skipped` });
   } else {
     const usable: Bounds = { minX: FRAME_BORDER, minY: FRAME_BORDER, maxX: paper.w - FRAME_BORDER, maxY: paper.h - FRAME_BORDER };
-    const tbW = Math.min(TITLE_BLOCK_W, (usable.maxX - usable.minX) / 2);
-    const tbH = Math.min(TITLE_BLOCK_H, (usable.maxY - usable.minY) / 4);
+    const tbW = TITLE_BLOCK_W;
+    const tbH = TITLE_BLOCK_H;
     const titleRegion: Bounds = { minX: usable.maxX - tbW, minY: usable.maxY - tbH, maxX: usable.maxX, maxY: usable.maxY };
 
     const items: { name: string; box: Bounds }[] = [

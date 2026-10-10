@@ -2,7 +2,8 @@ import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { SymbolSource, SymbolResolutionError, powerNetToken, type ResolvedSymbol } from './symsource.js';
-import { parseBomTable, normalizeValue } from '../../memory/bom-table.js';
+import { parseBomTable, normalizeValue, normalizeFootprint, bomFootprintRows } from '../../memory/bom-table.js';
+import { readFootprintPads, exposedPads, isMechanicalPad, formatPadMismatch, type FootprintResolver } from '../footprints.js';
 
 /**
  * The netlist-intent IR (`schematic.intent.json`): the compact declarative
@@ -57,6 +58,8 @@ export interface ValidatedIntent {
   symbols: Map<string, ResolvedSymbol>;
   /** SUBSYSTEMS.md heading names in declaration order, or null when absent. */
   docGroups: string[] | null;
+  /** What validation noticed but did not refuse: reported in the draft's notes. */
+  warnings: string[];
 }
 
 /** `## Heading` names from a markdown file, in order. */
@@ -81,9 +84,19 @@ async function headingsOf(file: string): Promise<string[] | null> {
  * verbatim and simply matches nothing, because the BOM contract is one row per
  * part — the row's single Rationale cell is where that part's purpose lives.
  */
-async function bomRowsOf(file: string): Promise<{ ref: string; value: string }[] | null> {
+async function bomRowsOf(file: string): Promise<{ ref: string; value: string; footprint: string }[] | null> {
   if (!existsSync(file)) return null;
-  const rows = parseBomTable(await readFile(file, 'utf8')).map((r) => ({ ref: r.refdes, value: r.value ?? '' }));
+  const md = await readFile(file, 'utf8');
+  // first row per refdes: the canonical BOM table leads the doc, and a later
+  // supporting table (pin assignments, costs) must not override its cells
+  const fps = new Map(bomFootprintRows(md).map((r) => [r.refdes, r.footprint]));
+  const seen = new Set<string>();
+  const rows: { ref: string; value: string; footprint: string }[] = [];
+  for (const r of parseBomTable(md)) {
+    if (seen.has(r.refdes)) continue;
+    seen.add(r.refdes);
+    rows.push({ ref: r.refdes, value: r.value ?? '', footprint: fps.get(r.refdes) ?? '' });
+  }
   return rows.length ? rows : null;
 }
 
@@ -158,8 +171,10 @@ export async function validateIntent(
   intent: SchematicIntent,
   symsource: SymbolSource,
   docsDir: string | null,
+  footprints?: FootprintResolver,
 ): Promise<{ ok: boolean; findings: IrFinding[]; validated: ValidatedIntent | null }> {
   const findings: IrFinding[] = [];
+  const warnings: string[] = [];
   const add = (detail: string): void => {
     findings.push({ detail });
   };
@@ -190,21 +205,96 @@ export async function validateIntent(
     partByRef.set(p.ref, p);
     try {
       const sym = await symsource.resolve(p.libId);
-      // A multi-unit symbol's units share symbol-space pin coordinates, so
-      // placing it as one instance overlays unrelated pins on one point and
-      // silently merges their nets (an LM358 drafted this way fused its two
-      // outputs). Refused until the engine can place units individually.
+      // A multi-unit symbol (an opamp, a gate pack) is placed one unit at a
+      // time: units share symbol-space pin coordinates, so a single placed
+      // instance would overlay unrelated pins on one point and silently merge
+      // their nets (an LM358 drafted that way fused its two outputs). Common
+      // (unit-0) pins are fine — KiCad draws them on every placed unit and
+      // the engine wires each appearance to the pin's one net. What is
+      // refused is a pin number repeated across NUMBERED units (an ambiguous
+      // endpoint), and a pin living only in a de Morgan alternate (it would
+      // vanish from the drawn sheet).
       if (sym.multiUnit) {
-        add(
-          `${p.ref}: "${p.libId}" is a multi-unit symbol (an opamp or gate pack), which the drafting engine ` +
-            `cannot place yet; use a single-unit part instead`,
+        const common = new Set(sym.commonUnitPins ?? []);
+        const owner = new Map<string, number>();
+        const shared = new Set<string>();
+        for (const u of sym.units ?? []) {
+          for (const pin of u.pins) {
+            if (common.has(pin.number)) continue;
+            const prev = owner.get(pin.number);
+            if (prev !== undefined && prev !== u.unit) shared.add(pin.number);
+            owner.set(pin.number, u.unit);
+          }
+        }
+        if (shared.size) {
+          add(
+            `${p.ref}: "${p.libId}" repeats pin(s) ${[...shared].sort().join(', ')} in more than one unit, so a ` +
+              `net endpoint cannot be mapped to a single placed unit; the drafting engine cannot place this symbol`,
+          );
+          continue;
+        }
+        const unmapped = [...new Set(sym.pins.map((pin) => pin.number))].filter(
+          (n) => !owner.has(n) && !common.has(n),
         );
-        continue;
+        if (unmapped.length) {
+          add(
+            `${p.ref}: "${p.libId}" defines pin(s) ${unmapped.sort().join(', ')} outside its default-style units, ` +
+              `so the drafting engine cannot place them; use a variant with conventional unit structure`,
+          );
+          continue;
+        }
       }
       symbols.set(p.ref, sym);
     } catch (e) {
       if (e instanceof SymbolResolutionError) add(`${p.ref}: ${e.message}`);
       else throw e;
+    }
+  }
+
+  // pins against pads (#314): a symbol pin its footprint has no pad for drops
+  // that pin's net off the board ("No pad found for pin" in KiCad). A footprint
+  // that does not resolve is the BOM gate's business, not this check's.
+  if (footprints) {
+    const byNum = (a: string, b: string): number => a.localeCompare(b, undefined, { numeric: true });
+    for (const p of partByRef.values()) {
+      const sym = symbols.get(p.ref);
+      if (!sym || sym.isPower || !p.footprint) continue;
+      const hit = await footprints.resolve(p.footprint);
+      if (!hit.ok) continue;
+      const { numbers: pads, heatsink } = await readFootprintPads(hit.file);
+      const symPins = new Set(sym.pins.map((pin) => pin.number));
+      const pins = [...symPins].filter((n) => !pads.has(n)).sort(byNum);
+      // and the reverse (#325): an electrical pad no symbol pin names gets no net
+      // and floats (a 16-contact USB-C receptacle under a 6-pin power-only
+      // symbol leaves half its VBUS and GND contacts unconnected). Mechanical,
+      // shield and thermal pads are exempt, they are unconnected by design: by
+      // KiCad's pad naming, by the library's heatsink property, or as the
+      // exposed pad of a footprint named for one (DFN-8-1EP's pad 9, which the
+      // charger symbol drawn for it does not name).
+      const exposed = exposedPads(p.footprint, pads, symPins);
+      const unpinned = [...pads].filter((n) => !isMechanicalPad(n) && !heatsink.has(n) && !exposed.has(n) && !symPins.has(n)).sort(byNum);
+      // A pad no pin names is a slip when its library ships the variant the
+      // symbol fits (the 6-contact receptacle beside the 16-contact one). When
+      // it ships none, the pairing is the library's own (a no-connect lead the
+      // symbol omits, as KiCad draws the FT232RL and the PIC families): noted
+      // in the draft report for the reader, not refused, since there is no
+      // footprint to change to.
+      const variant = unpinned.length && !pins.length ? await footprints.variantCovering(p.footprint, symPins) : null;
+      const mismatch = formatPadMismatch({ ref: p.ref, footprint: p.footprint, pins, pads: [...pads].sort(byNum), ...(unpinned.length ? { unpinned } : {}) });
+      if (pins.length || variant) {
+        const advice = [
+          pins.length ? `use a symbol whose pin numbers match the footprint's pads` : '',
+          unpinned.length
+            ? `use a footprint whose electrical pads are all pins of the symbol (${variant ? `${variant} in the same library matches` : 'KiCad often ships a variant with the matching contact count'})`
+            : '',
+        ].filter(Boolean);
+        add(`${mismatch}; ${advice.join(', or ')} (change the footprint in BOM.md and the intent together)`);
+      } else if (unpinned.length) {
+        warnings.push(
+          `${mismatch}; no footprint in its library matches the symbol's pins exactly, so these are taken as pads the library leaves ` +
+            `unconnected by design (an exposed pad, or a lead the symbol omits as no-connect); confirm against the datasheet before fabrication`,
+        );
+      }
     }
   }
 
@@ -341,9 +431,21 @@ export async function validateIntent(
   const bomRows = docsDir ? await bomRowsOf(path.join(docsDir, 'BOM.md')) : null;
   if (bomRows) {
     const bomByRef = new Map(bomRows.map((r) => [r.ref, r.value]));
+    const bomFootprint = new Map(bomRows.map((r) => [r.ref, r.footprint]));
     for (const p of partByRef.values()) {
       if (symbols.get(p.ref)?.isPower) continue;
       const bomValue = bomByRef.get(p.ref);
+      // The footprint was chosen at part selection and checked installed
+      // before this stage ran (#314); the intent carries it verbatim. Another
+      // package here would reach the board unchecked, so it is refused rather
+      // than accepted as a substitute.
+      const fp = bomFootprint.get(p.ref);
+      if (bomValue !== undefined && fp && normalizeFootprint(p.footprint) !== fp) {
+        add(
+          `${p.ref} footprint ${p.footprint ? `"${p.footprint}"` : '(none)'} differs from BOM.md's "${fp}"; ` +
+            `copy the BOM footprint exactly (do not substitute another package)`,
+        );
+      }
       if (bomValue === undefined) {
         add(`${p.ref} is not a BOM.md row; add it to the BOM or drop it from the intent`);
         continue;
@@ -377,7 +479,7 @@ export async function validateIntent(
   }
 
   if (findings.length) return { ok: false, findings, validated: null };
-  return { ok: true, findings: [], validated: { intent, symbols, docGroups } };
+  return { ok: true, findings: [], validated: { intent, symbols, docGroups, warnings } };
 }
 
 export function formatIrFindings(findings: IrFinding[]): string {

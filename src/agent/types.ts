@@ -30,16 +30,30 @@ export interface Turn {
    * a near-miss simply never set it.
    */
   nudge?: string;
+  /**
+   * A correction for a turn whose reply was cut short (#320): the model wrote
+   * harness-only blocks (`[result of …]`, `[user]`) after its tool calls, so
+   * that tail was discarded. The loop sends it to the model with the results of
+   * the calls that did run. Text-protocol providers set it; others never do.
+   */
+  notice?: string;
+  /** The text that was cut with it, for the transcript only (never sent to the model). */
+  discarded?: string;
 }
 
 export interface ChatOpts {
   maxTokens?: number;
   /**
-   * Liveness callback for the loop's heartbeat (5.1). A streaming provider calls
-   * it as output arrives, passing the cumulative streamed-output length in chars,
-   * so a slow turn can be told apart from a hung one. Providers that don't stream
-   * simply never call it (the heartbeat still reports elapsed time). Never used
-   * for billing — real token usage is reported once, on the returned Turn.
+   * Progress callback (5.1). A streaming provider calls it as the turn makes
+   * progress, passing the cumulative streamed-output length in chars. The loop
+   * uses it twice: the heartbeat shows the count, so a slow turn can be told
+   * apart from a hung one, and every call restarts the turn's inactivity
+   * watchdog, so a long turn that keeps producing output is not aborted as hung.
+   * Call it on any progress (thinking, block boundaries), not only new text; an
+   * unchanged count is fine. Providers that don't stream simply never call it
+   * (the heartbeat still reports elapsed time, and the watchdog acts as a
+   * whole-turn deadline). Never used for billing — real token usage is reported
+   * once, on the returned Turn.
    */
   onStream?: (streamedChars: number) => void;
 }

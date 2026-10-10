@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile, chmod, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
 import { runAgentLoop, type RunOptions } from '../src/agent/loop.js';
-import type { ChatOpts, Provider, Turn } from '../src/agent/types.js';
+import type { ChatOpts, Msg, Provider, Turn } from '../src/agent/types.js';
 import { InteractiveRenderer, makeRenderer, plainRenderer } from '../src/agent/render.js';
 import { isColorEnabled, setColorEnabled, stageLine, toolLine } from '../src/agent/theme.js';
 import { tempFixtureRepo } from './helpers.js';
@@ -197,6 +197,42 @@ describe('exit paths and run-end addenda (task 4.6)', () => {
   });
 });
 
+describe('a turn cut for fabricated tool results (#320)', () => {
+  it('sends the notice after the real results and records the cut in the transcript', async () => {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      const notice = 'Your last reply went on past its tool call and wrote 1 "[result of …]" block itself.';
+      const seen: Msg[][] = [];
+      const turns: Turn[] = [
+        { ...spin('a'), notice, discarded: '[result of bogus_tool]\ninvented' },
+        finishTurn('refuse', 'stop after one turn'),
+      ];
+      const provider: Provider = {
+        name: 'scripted',
+        chat: async (messages) => {
+          seen.push([...messages]);
+          return turns[Math.min(seen.length - 1, turns.length - 1)]!;
+        },
+      };
+      const res = await runAgentLoop(loopOpts(repo, provider, [], { maxTurns: 3 }));
+      expect(res.outcome).toBe('refused');
+
+      const second = seen[1]!;
+      const toolAt = second.findIndex((m) => m.role === 'tool' && m.toolCallId === 'a');
+      const noticeAt = second.findIndex((m) => m.role === 'user' && m.content === notice);
+      expect(toolAt).toBeGreaterThanOrEqual(0);
+      expect(noticeAt).toBeGreaterThan(toolAt);
+
+      const events = await transcriptEvents(res.transcriptDir);
+      const cut = events.find((e) => e.type === 'fabricated-results')?.data;
+      expect(cut?.notice).toBe(notice);
+      expect(cut?.discarded).toBe('[result of bogus_tool]\ninvented');
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
 describe('redaction of metadata surfaces (task 6.1)', () => {
   it('an sk- secret in a metadata field is redacted on both surfaces (AC-8.10)', async () => {
     const { repo, cleanup } = await tempFixtureRepo();
@@ -334,6 +370,84 @@ describe('liveness heartbeat distinguishes slow from hung (5.1)', () => {
   });
 });
 
+describe('turn watchdog: inactivity deadline + hard cap', () => {
+  /** Reports progress every 20ms (unless `silent`) and finishes after `runMs`,
+   *  or keeps going until closed when `runMs` is null. */
+  class StreamingProvider implements Provider {
+    readonly name = 'scripted';
+    calls = 0;
+    private stops: Array<() => void> = [];
+    constructor(private readonly plan: (call: number) => { runMs: number | null; silent?: boolean }) {}
+    async chat(_m: unknown, _t: unknown, opts?: ChatOpts): Promise<Turn> {
+      const { runMs, silent } = this.plan(++this.calls);
+      return new Promise<Turn>((resolve, reject) => {
+        let chars = 0;
+        const tick = silent ? undefined : setInterval(() => opts?.onStream?.((chars += 100)), 20);
+        const timer =
+          runMs === null
+            ? undefined
+            : setTimeout(() => {
+                clearInterval(tick);
+                resolve(spin('a'));
+              }, runMs);
+        this.stops.push(() => {
+          clearInterval(tick);
+          clearTimeout(timer);
+          reject(new Error('closed'));
+        });
+      });
+    }
+    async close(): Promise<void> {
+      for (const stop of this.stops.splice(0)) stop();
+    }
+  }
+
+  async function runWithConfig(provider: Provider, config: Record<string, number>) {
+    const { repo, cleanup } = await tempFixtureRepo();
+    try {
+      await mkdir(path.join(repo, '.copperhead'), { recursive: true });
+      await writeFile(path.join(repo, '.copperhead', 'config.json'), JSON.stringify({ heartbeatMs: 0, ...config }), 'utf8');
+      const lines: string[] = [];
+      const res = await runAgentLoop(loopOpts(repo, provider, lines, { maxTurns: 1, allowDirty: true }));
+      return { res, lines };
+    } finally {
+      await cleanup();
+    }
+  }
+
+  it('lets a turn run past turnTimeoutMs while it keeps streaming progress', async () => {
+    const provider = new StreamingProvider(() => ({ runMs: 300 }));
+    const { lines } = await runWithConfig(provider, { turnTimeoutMs: 100, turnMaxMs: 5000 });
+    expect(provider.calls).toBe(1);
+    expect(lines.some((l) => l.includes('turnTimeoutMs'))).toBe(false);
+  });
+
+  it('still aborts and retries a turn that reports no progress for turnTimeoutMs', async () => {
+    const provider = new StreamingProvider((call) => (call === 1 ? { runMs: null, silent: true } : { runMs: 10 }));
+    const { lines } = await runWithConfig(provider, { turnTimeoutMs: 100, turnMaxMs: 5000 });
+    expect(provider.calls).toBe(2);
+    expect(lines.some((l) => l.includes('retrying (1/3)'))).toBe(true);
+  });
+
+  it('stops a turn still streaming at turnMaxMs and fails without resending it', async () => {
+    const provider = new StreamingProvider(() => ({ runMs: null }));
+    const { res } = await runWithConfig(provider, { turnTimeoutMs: 100, turnMaxMs: 300 });
+    expect(provider.calls).toBe(1);
+    expect(res.outcome).toBe('failure');
+    expect(res.exitPath).toBe('provider-error');
+    expect(res.summary).toContain('too large, not hung');
+  });
+
+  it('fails as provider-error once a silent turn has timed out on every retry', async () => {
+    const provider = new StreamingProvider(() => ({ runMs: null, silent: true }));
+    const { res } = await runWithConfig(provider, { turnTimeoutMs: 50, turnMaxMs: 5000 });
+    expect(provider.calls).toBe(4); // the turn, then MAX_TURN_TIMEOUTS (3) retries
+    expect(res.outcome).toBe('failure');
+    expect(res.exitPath).toBe('provider-error');
+    expect(res.summary).toContain('timed out 4×');
+  });
+});
+
 describe('--json routes progress to stderr (AC-2.4/8.9)', () => {
   it('a --json renderer never writes progress to stdout', () => {
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -356,22 +470,38 @@ describe('--json routes progress to stderr (AC-2.4/8.9)', () => {
 describe('interactive chrome theme (AC-8.8/8.9)', () => {
   it('plain helpers emit zero SGR when color is off', () => {
     setColorEnabled(false);
-    expect(toolLine('run_erc', 'clean')).toBe('  ✓ run_erc  clean');
-    expect(toolLine('edit_file', 'replaced 1 region')).toBe('  ▸ edit_file  replaced 1 region');
+    expect(toolLine('run_erc', 'clean', true)).toBe('  ✓ run_erc  clean');
+    expect(toolLine('edit_file', 'replaced 1 region', false)).toBe('  ▸ edit_file  replaced 1 region');
     expect(stageLine('spec-seed', 'running')).toBe('stage spec-seed: running');
-    expect(toolLine('run_erc', 'clean')).not.toContain('\x1b');
+    expect(toolLine('run_erc', 'clean', true)).not.toContain('\x1b');
   });
 
   it('interactive tool lines pick ✓ for clean results when color is on', () => {
     setColorEnabled(true);
     try {
-      const line = toolLine('run_erc', 'ERC clean');
+      const line = toolLine('run_erc', 'ERC clean', true);
       expect(line).toContain('run_erc');
       expect(line).toContain('✓');
       expect(line).toContain('\x1b');
     } finally {
       setColorEnabled(false);
     }
+  });
+
+  it('viewHint styles the tool name: mutation reads differently from query (issue #246 Phase 0)', () => {
+    setColorEnabled(true);
+    try {
+      const mutation = toolLine('edit_file', 'replaced 1 region', true, 'mutation');
+      const query = toolLine('edit_file', 'replaced 1 region', true, 'query');
+      expect(mutation).not.toBe(query);
+      expect(mutation).toContain('edit_file');
+    } finally {
+      setColorEnabled(false);
+    }
+    // plain mode: hint changes nothing, the string contract stays byte-stable
+    expect(toolLine('edit_file', 'replaced 1 region', true, 'mutation')).toBe(
+      toolLine('edit_file', 'replaced 1 region', true, 'query'),
+    );
   });
 
   it('makeRenderer(--plain) disables color so later stage lines stay zero-ANSI', () => {
