@@ -695,10 +695,12 @@ describe('review: the copperhead-tools client', () => {
   it('keeps multi-byte characters intact when a result spans pipe chunks', async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'review-test-'));
     const script = path.join(dir, 'big-tools.js');
-    // About 240 KB of two-byte characters, so the result crosses many pipe chunks.
+    // About 300 KB across many pipe chunks. The repeated unit is 9 bytes (two 2-byte
+    // characters, one 3-byte), an odd period, so some chunk boundary splits a character
+    // whatever the length of the JSON envelope in front of it.
     const body = `process.stdin.resume();
 process.stdin.on('end', () => {
-  const text = 'x' + '\u00b5\u03a9\u00b1'.repeat(60000);
+  const text = 'x' + '\u00b5\u03a9\u00b1\u20ac'.repeat(60000);
   process.stdout.write(JSON.stringify({ status: 'ok', tool: { id: 'review-query', version: '0' }, data: { text } }));
 });
 `;
@@ -707,7 +709,7 @@ process.stdin.on('end', () => {
     const result = await client.run('review-query', {});
     const text = (result.data as { text: string }).text;
     expect(text).not.toContain('\uFFFD');
-    expect(text).toBe('x' + '\u00b5\u03a9\u00b1'.repeat(60000));
+    expect(text).toBe('x' + 'µΩ±€'.repeat(60000));
   });
   it('stops the tool process when cancelled', async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'review-test-'));
